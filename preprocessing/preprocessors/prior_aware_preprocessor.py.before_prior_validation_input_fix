@@ -1,0 +1,154 @@
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Optional, Union
+
+import numpy as np
+from scipy.ndimage import distance_transform_edt
+
+from nnunetv2.preprocessing.preprocessors.default_preprocessor2 import INTERMEDIATE_SHAPE
+from nnunetv2.preprocessing.preprocessors.umamba_preprocessor import UMambaPreprocessor
+from nnunetv2.utilities.plans_handling.plans_handler import ConfigurationManager, PlansManager
+
+
+def compute_signed_distance(mask: np.ndarray, max_distance: float = 20.0) -> np.ndarray:
+    mask = np.asarray(mask > 0.5, dtype=bool)
+    if mask.size == 0:
+        return mask.astype(np.float32)
+    if mask.any():
+        inside = distance_transform_edt(mask)
+    else:
+        inside = np.zeros(mask.shape, dtype=np.float32)
+    if (~mask).any():
+        outside = distance_transform_edt(~mask)
+    else:
+        outside = np.zeros(mask.shape, dtype=np.float32)
+    sdf = inside - outside
+    sdf = np.clip(sdf, -max_distance, max_distance) / max_distance
+    return sdf.astype(np.float32)
+
+
+class PriorAwareRefinerPreprocessor(UMambaPreprocessor):
+    """
+    UMamba-compatible preprocessor plus the fourth prior channel.
+
+    Training .npz files keep the original nnU-Net image under ``data`` and add:
+      coarse, uncertainty, coarse_sdf
+
+    Raw inference returns a four-channel tensor directly:
+      MRI, coarse, uncertainty, coarse_sdf
+    """
+
+    SDF_KEY = "coarse_sdf"
+
+    def run_case_save(
+        self,
+        output_filename_truncated: str,
+        image_files: list[str],
+        seg_file: Union[str, None],
+        plans_manager: PlansManager,
+        configuration_manager: ConfigurationManager,
+        dataset_json: dict,
+    ):
+        super().run_case_save(
+            output_filename_truncated,
+            image_files,
+            seg_file,
+            plans_manager,
+            configuration_manager,
+            dataset_json,
+        )
+        npz_path = output_filename_truncated + ".npz"
+        with np.load(npz_path) as saved:
+            data = saved["data"]
+            seg = saved["seg"]
+            coarse = saved["coarse"].astype(np.float32)
+            uncertainty = saved["uncertainty"].astype(np.float32)
+        coarse_sdf = compute_signed_distance(coarse[0])[None]
+        np.savez_compressed(
+            npz_path,
+            data=data,
+            seg=seg,
+            coarse=coarse.astype(np.float32),
+            uncertainty=uncertainty.astype(np.float32),
+            coarse_sdf=coarse_sdf.astype(np.float32),
+        )
+
+    def run_case(
+        self,
+        image_files: list[str],
+        seg_file: Union[str, None],
+        plans_manager: PlansManager,
+        configuration_manager: ConfigurationManager,
+        dataset_json: Union[dict, str],
+    ):
+        data, seg, properties = super(UMambaPreprocessor, self).run_case(
+            image_files,
+            seg_file,
+            plans_manager,
+            configuration_manager,
+            dataset_json,
+        )
+
+        t4d = (0,) + tuple(ax + 1 for ax in self.FINAL_TRANSPOSE)
+        data = data.transpose(t4d)
+        if seg is not None:
+            seg = seg.transpose(t4d)
+
+        sidecars = self._load_sidecars_for_image(image_files[0])
+        if sidecars is None:
+            case_id = self._case_id_from_image_file(image_files[0])
+            raise FileNotFoundError(
+                f"Prior-aware inference requires coarse and uncertainty sidecars for {case_id}. "
+                "Expected folders such as coarseTs/coarseTr and uncertaintyTs/uncertaintyTr next to images."
+            )
+
+        coarse_path, uncertainty_path = sidecars
+        coarse = self._load_and_resample_nifti(coarse_path, INTERMEDIATE_SHAPE, order=0)
+        uncertainty = self._load_and_resample_nifti(uncertainty_path, INTERMEDIATE_SHAPE, order=1)
+        coarse = coarse.transpose(self.FINAL_TRANSPOSE)
+        uncertainty = uncertainty.transpose(self.FINAL_TRANSPOSE)
+        coarse_sdf = compute_signed_distance(coarse)
+        data = np.concatenate(
+            [
+                data.astype(np.float32, copy=False),
+                coarse[None].astype(np.float32),
+                uncertainty[None].astype(np.float32),
+                coarse_sdf[None].astype(np.float32),
+            ],
+            axis=0,
+        )
+        return data, seg, properties
+
+    @staticmethod
+    def _load_sidecars_for_image(image_file: str) -> Optional[tuple[Path, Path]]:
+        image_path = Path(image_file)
+        case_id = UMambaPreprocessor._case_id_from_image_file(image_file)
+        dataset_root = image_path.parent.parent
+        coarse_folders = ("coarseTs", "coarseTr", "coarse")
+        uncertainty_folders = ("uncertaintyTs", "uncertaintyTr", "uncertainty")
+
+        coarse_path = None
+        uncertainty_path = None
+        for folder in coarse_folders:
+            candidate = dataset_root / folder / f"{case_id}.nii.gz"
+            if candidate.exists():
+                coarse_path = candidate
+                break
+        for folder in uncertainty_folders:
+            candidate = dataset_root / folder / f"{case_id}.nii.gz"
+            if candidate.exists():
+                uncertainty_path = candidate
+                break
+
+        if coarse_path is None and uncertainty_path is None:
+            return None
+        if coarse_path is None or uncertainty_path is None:
+            raise FileNotFoundError(
+                f"Found only one sidecar for {case_id}. Need both coarse and uncertainty maps."
+            )
+        return coarse_path, uncertainty_path
+
+
+class UM_no_boundingBox_Preprocessor(PriorAwareRefinerPreprocessor):
+    """Compatibility alias for the CIMP plans already using this preprocessor name."""
